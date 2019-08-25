@@ -8,14 +8,18 @@ import (
 	"time"
 )
 
+
+
+
+
 // Config is used to tune the Yamux session
 type Config struct {
-	// AcceptBacklog is used to limit how many streams may be
-	// waiting an accept.
+
+
+	// AcceptBacklog is used to limit how many streams may be waiting an accept.
 	AcceptBacklog int
 
-	// EnableKeepalive is used to do a period keep alive
-	// messages using a ping.
+	// EnableKeepalive is used to do a period keep alive messages using a ping.
 	EnableKeepAlive bool
 
 	// KeepAliveInterval is how often to perform the keep alive
