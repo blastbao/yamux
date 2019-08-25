@@ -785,12 +785,15 @@ func (s *Session) handleStreamMessage(hdr header) error {
 		return nil
 	}
 
-
-
-
-
-
 	// Read the new data
+
+	// 读取数据:
+	// 1. 根据 flags 标识判断连接状态，来更新 stream 的连接状态 state。
+	// 2. 如果 hdr.length 为 0，则无数据可读，直接返回
+	// 3. 如果待读取的数据长度超过可用窗口大小，则直接报错
+	// 4. 如果接收缓存 stream.recvBuf 为空，则初始化
+	// 5. 从 s.bufRead 读取 length 个字节到 stream.recvBuf 中
+	// 6. 因为新读取的数据占用了窗口空间，需要减少接收窗口的大小
 	if err := stream.readData(hdr, flags, s.bufRead); err != nil {
 		if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
 			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)

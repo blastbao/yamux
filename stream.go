@@ -84,30 +84,17 @@ func (s *Stream) StreamID() uint32 {
 	return s.id
 }
 
-
-
-
-
 // Read is used to read from the stream
 func (s *Stream) Read(b []byte) (n int, err error) {
 
-
-
-
 	defer asyncNotify(s.recvNotifyCh)
 
-
-
 START:
+
+	// 1. 异常状态检查
+	// 	1.1 当前 state 处于 streamLocalClose/streamRemoteClose/streamClosed 状态，直接返回 io.EOF，告知连接已关闭。
+	// 	1.2 当前 state 处于 streamReset 状态，直接返回 ErrConnectionReset，告知连接已重置。
 	s.stateLock.Lock()
-
-
-
-
-
-
-
-
 	switch s.state {
 	case streamLocalClose:
 		fallthrough
@@ -125,40 +112,53 @@ START:
 		s.stateLock.Unlock()
 		return 0, ErrConnectionReset
 	}
-
-
 	s.stateLock.Unlock()
+
 
 	// If there is no data available, block
 	s.recvLock.Lock()
+
+	// 2. 如果无数据可读，则跳转到 WAIT 处等待数据。
 	if s.recvBuf == nil || s.recvBuf.Len() == 0 {
 		s.recvLock.Unlock()
 		goto WAIT
 	}
 
+
 	// Read any bytes
+
+	// 3. 如果有数据可读，就把数据从 s.recvBuf 读到 b []byte 中，读取的字节数为 n
 	n, _ = s.recvBuf.Read(b)
 	s.recvLock.Unlock()
 
 	// Send a window update potentially
+	// 4. 因为读取了数据，窗口有部分空间释放，则告知对端窗口大小变更了
 	err = s.sendWindowUpdate()
 	return n, err
 
 WAIT:
+
+
+	// 5. 阻塞式等待有数据可读
+
+	// 设置超时定时器
 	var timeout <-chan time.Time
 	var timer *time.Timer
-	readDeadline := s.readDeadline.Load().(time.Time)
+	readDeadline := s.readDeadline.Load().(time.Time) //获取超时时间
 	if !readDeadline.IsZero() {
 		delay := readDeadline.Sub(time.Now())
 		timer = time.NewTimer(delay)
 		timeout = timer.C
 	}
+
 	select {
+	// 等待数据可读通知，如果有通知到达，就返回到 START 处重试。
 	case <-s.recvNotifyCh:
 		if timer != nil {
 			timer.Stop()
 		}
 		goto START
+	// 监听超时事件
 	case <-timeout:
 		return 0, ErrTimeout
 	}
@@ -481,7 +481,7 @@ func (s *Stream) processFlags(flags uint16) error {
 	}
 
 	// 3. 收到 RST 包，需要重置连接。
-	// 则把 state 流转至 Reset，同时设置流关闭标识 closeStream 为 true。
+	// 把 state 流转至 Reset，同时设置流关闭标识 closeStream 为 true。
 	if flags&flagRST == flagRST {
 		s.state = streamReset
 		closeStream = true
@@ -520,47 +520,61 @@ func (s *Stream) incrSendWindow(hdr header, flags uint16) error {
 }
 
 // readData is used to handle a data frame
+//
+// 1. 根据 flags 标识判断连接状态，来更新 Stream 的连接状态 state。
+// 2. 如果 hdr.length 为 0，则无数据可读，直接返回
+// 3. 如果待读取的数据长度超过可用窗口大小，则直接报错
+// 4. 如果接收 s.recvBuf 为空，则初始化
+// 5. 从 conn 读取 length 个字节到 s.recvBuf 中
+// 6. 因为新读取的数据占用了窗口空间，需要减少接收窗口的大小
+
 func (s *Stream) readData(hdr header, flags uint16, conn io.Reader) error {
 
 
-	//
+	// 1. 根据 flags 标识判断连接状态，从而更新 Stream 的连接状态 state。
 	if err := s.processFlags(flags); err != nil {
 		return err
 	}
 
-	// Check that our recv window is not exceeded
+	// 2. 如果 length 为 0，则无数据可读，直接返回
 	length := hdr.Length()
 	if length == 0 {
 		return nil
 	}
 
-	// Wrap in a limited reader
+	//【重要！！！】 Wrap in a limited reader
 	conn = &io.LimitedReader{R: conn, N: int64(length)}
 
-	// Copy into buffer
 	s.recvLock.Lock()
 
+	// 3. 如果待读取的数据长度超过可用窗口大小，则直接报错
 	if length > s.recvWindow {
 		s.session.logger.Printf("[ERR] yamux: receive window exceeded (stream: %d, remain: %d, recv: %d)", s.id, s.recvWindow, length)
 		return ErrRecvWindowExceeded
 	}
 
+	// 4. 如果接收 buf 为空，则初始化
 	if s.recvBuf == nil {
 		// Allocate the receive buffer just-in-time to fit the full data frame.
 		// This way we can read in the whole packet without further allocations.
 		s.recvBuf = bytes.NewBuffer(make([]byte, 0, length))
 	}
+
+	// 5. 从 conn 读取 length 个字节到 s.recvBuf 中
 	if _, err := io.Copy(s.recvBuf, conn); err != nil {
 		s.session.logger.Printf("[ERR] yamux: Failed to read stream data: %v", err)
 		s.recvLock.Unlock()
 		return err
 	}
 
-	// Decrement the receive window
+	// 6. 因为新数据占用了窗口，需要减少窗口大小
 	s.recvWindow -= length
+
 	s.recvLock.Unlock()
 
 	// Unblock any readers
+
+	// 7. ....
 	asyncNotify(s.recvNotifyCh)
 	return nil
 }
