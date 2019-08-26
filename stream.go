@@ -115,8 +115,10 @@ START:
 	s.stateLock.Unlock()
 
 
-	// If there is no data available, block
+
 	s.recvLock.Lock()
+
+	// If there is no data available, block
 
 	// 2. 如果无数据可读，则跳转到 WAIT 处等待数据。
 	if s.recvBuf == nil || s.recvBuf.Len() == 0 {
@@ -124,15 +126,16 @@ START:
 		goto WAIT
 	}
 
-
 	// Read any bytes
 
 	// 3. 如果有数据可读，就把数据从 s.recvBuf 读到 b []byte 中，读取的字节数为 n
 	n, _ = s.recvBuf.Read(b)
+
 	s.recvLock.Unlock()
 
+
 	// Send a window update potentially
-	// 4. 因为读取了数据，窗口有部分空间释放，则告知对端窗口大小变更了
+	// 4. 因为读取了数据，s.recvBuf 中有部分空间被释放，则告知对端窗口大小变更了
 	err = s.sendWindowUpdate()
 	return n, err
 
@@ -168,6 +171,8 @@ WAIT:
 func (s *Stream) Write(b []byte) (n int, err error) {
 	s.sendLock.Lock()
 	defer s.sendLock.Unlock()
+
+	// 循环的分片发送，total 保存每次发送后的总字节，用来保证完整发送完 len(b) 的数据
 	total := 0
 	for total < len(b) {
 		n, err := s.write(b[total:])
@@ -176,6 +181,7 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 			return total, err
 		}
 	}
+
 	return total, nil
 }
 
@@ -185,6 +191,13 @@ func (s *Stream) write(b []byte) (n int, err error) {
 	var max uint32
 	var body io.Reader
 START:
+
+	// 1. 异常状态检查
+	// 	1.1 当前 state 处于 streamLocalClose/streamClosed 状态，返回 ErrStreamClosed，告知 stream 已关闭。
+	// 	1.2 当前 state 处于 streamReset 状态，直接返回 ErrConnectionReset，告知连接已重置。
+	//
+	// 值得注意的是，若 state 正处 streamRemoteClose 状态，属于半关闭状态，不影响本端正常的 write 。
+
 	s.stateLock.Lock()
 	switch s.state {
 	case streamLocalClose:
@@ -199,37 +212,42 @@ START:
 	s.stateLock.Unlock()
 
 	// If there is no data available, block
+	// 2. 获取发送窗口大小，若为 0 则阻塞式等待有可用发送窗口。
 	window := atomic.LoadUint32(&s.sendWindow)
 	if window == 0 {
 		goto WAIT
 	}
 
 	// Determine the flags if any
+	// 3. sendFlags() 根据当前流 Stream 的状态 state 确定适当的标志 flags 。
 	flags = s.sendFlags()
 
 	// Send up to our send window
+	// 4. 最多只能发送剩余窗口 window 大小的数据
 	max = min(window, uint32(len(b)))
 	body = bytes.NewReader(b[:max])
 
 	// Send the header
-	//
+	// 5. 构造 Data 类型数据包头 header
 	s.sendHdr.encode(typeData, flags, s.id, max)
 
-
-	//
+	// 6. 阻塞式的发送消息 Msg(header + body) 给对端，网络发送结果被发送到 s.sendErr 管道中
 	if err = s.session.waitForSendErr(s.sendHdr, body, s.sendErr); err != nil {
 		return 0, err
 	}
 
 	// Reduce our send window
+	// 7. 发送完毕，释放发送窗口资源
 	atomic.AddUint32(&s.sendWindow, ^uint32(max-1))
 
 	// Unlock
 	return int(max), err
 
-
 WAIT:
 
+	// 8. 阻塞式等待网络可写
+
+	// 设置超时定时器
 	var timeout <-chan time.Time
 	writeDeadline := s.writeDeadline.Load().(time.Time)
 	if !writeDeadline.IsZero() {
@@ -238,6 +256,7 @@ WAIT:
 	}
 
 	select {
+	// 等待数据可写通知，如果有通知到达，就返回到 START 处重试。
 	case <-s.sendNotifyCh:
 		goto START
 	case <-timeout:
@@ -381,6 +400,12 @@ func (s *Stream) sendClose() error {
 // Close is used to close the stream
 func (s *Stream) Close() error {
 	closeStream := false
+
+	// 如果当前 Stream 处于 streamSYNSent/streamSYNReceived/streamEstablished 状态，则将 Stream 流转至 streamLocalClose 状态，然后转到 SEND_CLOSE 标签。
+	// 如果当前 Stream 处于 streamRemoteClose 状态，则将 Stream 流转至 streamClosed 状态，然后转到 SEND_CLOSE 标签。
+	// 如果当前 Stream 处于 streamLocalClose/streamClosed/streamReset 状态，啥也不干。
+	// 如果当前 Stream 处于其它未知状态，则 Panic 。
+
 	s.stateLock.Lock()
 	switch s.state {
 	// Opened means we need to signal a close
@@ -389,12 +414,12 @@ func (s *Stream) Close() error {
 	case streamSYNReceived:
 		fallthrough
 	case streamEstablished:
-		s.state = streamLocalClose
+		s.state = streamLocalClose 	//半关闭
 		goto SEND_CLOSE
 
 	case streamLocalClose:
 	case streamRemoteClose:
-		s.state = streamClosed
+		s.state = streamClosed 		// 全关闭
 		closeStream = true
 		goto SEND_CLOSE
 
@@ -404,11 +429,19 @@ func (s *Stream) Close() error {
 		panic("unhandled state")
 	}
 	s.stateLock.Unlock()
+
 	return nil
+
 SEND_CLOSE:
 	s.stateLock.Unlock()
+
+	// 发送 FIN 控制信令给对端
 	s.sendClose()
+
+	// 因为 state 有变化，调用 s.notifyWaiting() 唤醒 write() 和 read() 过程中的阻塞操作。
 	s.notifyWaiting()
+
+	// 如果是全关闭，则执行 close 操作。
 	if closeStream {
 		s.session.closeStream(s.id)
 	}
@@ -420,6 +453,8 @@ func (s *Stream) forceClose() {
 	s.stateLock.Lock()
 	s.state = streamClosed
 	s.stateLock.Unlock()
+
+	// 因为 state 有变化，调用 s.notifyWaiting() 唤醒 write() 和 read() 过程中的阻塞操作。
 	s.notifyWaiting()
 }
 
@@ -428,7 +463,7 @@ func (s *Stream) forceClose() {
 //
 // 1. 根据 flags 标识判断连接状态，从而更新 Stream 的 state。
 // 2. 如果 flags 状态意味着连接的关闭，则在函数退出前会执行 closeStream() 关闭 Stream。
-// 3. 在特定时刻调用 s.notifyWaiting() ...... ????
+// 3. 当流因被关闭、重置流转到 streamRemoteClose/streamClosed/streamReset 状态后，调用 s.notifyWaiting() 唤醒 write() 和 read() 过程中的阻塞操作。
 func (s *Stream) processFlags(flags uint16) error {
 
 
@@ -505,16 +540,16 @@ func (s *Stream) incrSendWindow(hdr header, flags uint16) error {
 
 	// 如果收到 WindowUpdate 类型消息，意味着收到了控制信息，需要检查其所含的 flags，并更新当前窗口大小。
 
-	// 1. 这里先调用 s.processFlags() 检查一下消息附带的 flags，根据 flags 是 ACK、FIN、RST 来更新 stream 的 state 状态。
+	// 1. 这里先调用 s.processFlags() 检查一下消息附带的 flags，根据 flags 是 ACK、FIN、RST 来更新 Stream 的 state 状态。
 	if err := s.processFlags(flags); err != nil {
 		return err
 	}
 
 	// Increase window, unblock a sender
-	// 2. 更新 stream 窗口大小
+	// 2. 增加 Stream 窗口大小。
 	atomic.AddUint32(&s.sendWindow, hdr.Length())
 
-	// 3.
+	// 3. 触发可写事件，使 write() 中 WAIT 代码块里的阻塞能被唤醒，以执行数据写入。
 	asyncNotify(s.sendNotifyCh)
 	return nil
 }

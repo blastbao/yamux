@@ -762,11 +762,6 @@ func (s *Session) handleStreamMessage(hdr header) error {
 		return nil
 	}
 
-
-
-
-
-
 	// Check if this is a window update
 
 	//【重要】如果当前消息是 WindowUpdate 类型，意味着收到了控制信息，需要检查其所含的 flags

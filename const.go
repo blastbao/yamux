@@ -73,7 +73,6 @@ const (
 
 const (
 
-
 	// SYN is sent to signal a new stream.
 	// May be sent with a data payload
 	flagSYN uint16 = 1 << iota
@@ -107,8 +106,6 @@ const (
 	goAwayInternalErr
 )
 
-
-
 const (
 	sizeOfVersion  = 1
 	sizeOfType     = 1
@@ -119,8 +116,6 @@ const (
 	// 16B
 	headerSize     = sizeOfVersion + sizeOfType + sizeOfFlags + sizeOfStreamID + sizeOfLength
 )
-
-
 
 type header []byte
 
